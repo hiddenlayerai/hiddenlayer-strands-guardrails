@@ -1,5 +1,7 @@
 from hiddenlayer import HiddenLayer
-from strands.types._events import ModelMessageEvent, EventLoopStopEvent
+from hiddenlayer.types import InteractionAnalyzeResponse
+from strands.types._events import EventLoopStopEvent, TextStreamEvent
+from strands.types.streaming import ContentBlockDelta
 import strands
 
 from strands import Agent
@@ -15,6 +17,7 @@ class HiddenlayerStrands:
         model: str,
         client_id: Optional[str],
         client_secret: Optional[str],
+        hl_block_message: str = "Blocked by Hiddenlayer",
         hl_project_id: Optional[str] = None,
         hl_requester_id: str = "Strands Agent",
         hl_client: Optional[HiddenLayer] = None,
@@ -22,55 +25,114 @@ class HiddenlayerStrands:
         self.model = model
         self.project_id = hl_project_id
         self.requester_id = hl_requester_id
+        self.block_message = hl_block_message
         self.hl_client = hl_client or HiddenLayer(base_url="https://api.stage.hiddenlayer.ai")
 
-    async def new_event_loop_cycle(self, agent: Agent, invocation_state, structured_output_context=None):
+    def analyze_input(self, role: str, content: str) -> InteractionAnalyzeResponse:
+        if self.project_id:
+            analysis = self.hl_client.interactions.analyze(
+                metadata={"model": self.model, "requester_id": self.requester_id},
+                hl_project_id=self.project_id,
+                input={"messages": [{"role": role, "content": content}]},
+            )
+        else:
+            analysis = self.hl_client.interactions.analyze(
+                metadata={"model": self.model, "requester_id": self.requester_id},
+                input={"messages": [{"role": role, "content": content}]},
+            )
+
+        return analysis
+
+    def analyze_output(self, content: str) -> InteractionAnalyzeResponse:
+        if self.project_id:
+            analysis = self.hl_client.interactions.analyze(
+                metadata={"model": self.model, "requester_id": self.requester_id},
+                hl_project_id=self.project_id,
+                output={"messages": [{"role": "assistant", "content": str(content)}]},
+            )
+        else:
+            analysis = self.hl_client.interactions.analyze(
+                metadata={"model": self.model, "requester_id": self.requester_id},
+                output={"messages": [{"role": "assistant", "content": str(content)}]},
+            )
+        return analysis
+
+    async def hl_event_loop_cycle(self, agent: Agent, invocation_state, structured_output_context=None):
         # Otherwise, delegate and optionally intercept / modify events
         print(agent.messages[-1])
         if text := agent.messages[-1]["content"][-1].get("text"):
-            if self.project_id:
-                analysis = self.hl_client.interactions.analyze(
-                    metadata={"model": self.model, "requester_id": self.requester_id},
-                    hl_project_id=self.project_id,
-                    input={"messages": [{"role": agent.messages[-1]["role"], "content": text}]},
-                )
-            else:
-                analysis = self.hl_client.interactions.analyze(
-                    metadata={"model": self.model, "requester_id": self.requester_id},
-                    input={"messages": [{"role": agent.messages[-1]["role"], "content": text}]},
-                )
-
-            # TODO: Need to stream a SSE with key 'Data' as well
+            analysis = self.analyze_input(role=agent.messages[-1]["role"], content=text)
             if analysis.evaluation and analysis.evaluation.action == "Block":
+                yield TextStreamEvent(
+                    delta=ContentBlockDelta(text=self.block_message),
+                    text=self.block_message,
+                )
                 yield EventLoopStopEvent(
                     stop_reason="end_turn",
-                    message={"role": "assistant", "content": [{"text": "Blocked by Hiddenlayer"}]},
+                    message={"role": "assistant", "content": [{"text": self.block_message}]},
                     metrics=agent.event_loop_metrics,
                     request_state=None,
                 )
                 return
 
+            if analysis.evaluation and analysis.modified_data.input.messages and analysis.evaluation.action == "Redact":
+                agent.messages[-1]["content"][-1]["text"] = analysis.modified_data.input.messages[-1].content
+
         events = []
         async for ev in event_loop_cycle(agent, invocation_state, structured_output_context):
             events.append(ev)
+
             if isinstance(ev, EventLoopStopEvent):
                 final_message = ev["stop"][1]
-                if self.project_id:
-                    analysis = self.hl_client.interactions.analyze(
-                        metadata={"model": "strands-sdk", "requester_id": "test-app"},
-                        hl_project_id=self.project_id,
-                        output={"messages": [{"role": "assistant", "content": final_message["content"][-1]["text"]}]},
-                    )
+
+                # Handled structured output case where each field in the structured output
+                # is its own output
+                if structured_output_context.is_enabled:
+                    outputs = final_message["content"][-1]["toolUse"]["input"]
+
+                    for output in outputs.values():
+                        analysis = self.analyze_output(output)
+
+                        if analysis.evaluation and analysis.evaluation.action == "Block":
+                            yield TextStreamEvent(
+                                delta=ContentBlockDelta(text=self.block_message),
+                                text=self.block_message,
+                            )
+                            yield EventLoopStopEvent(
+                                stop_reason="end_turn",
+                                message={"role": "assistant", "content": [{"text": self.block_message}]},
+                                metrics=agent.event_loop_metrics,
+                                request_state=None,
+                            )
+                            return
                 else:
-                    analysis = self.hl_client.interactions.analyze(
-                        metadata={"model": "strands-sdk", "requester_id": "test-app"},
-                        output={"messages": [{"role": "assistant", "content": final_message["content"][-1]["text"]}]},
+                    analysis = self.analyze_output(content=final_message["content"][-1]["text"])
+                    if analysis.evaluation and analysis.evaluation.action == "Block":
+                        yield TextStreamEvent(
+                            delta=ContentBlockDelta(text=self.block_message),
+                            text=self.block_message,
+                        )
+                        yield EventLoopStopEvent(
+                            stop_reason="end_turn",
+                            message={"role": "assistant", "content": [{"text": self.block_message}]},
+                            metrics=agent.event_loop_metrics,
+                            request_state=None,
+                        )
+                        return
+
+                if (
+                    analysis.evaluation
+                    and analysis.modified_data.output.messages
+                    and analysis.evaluation.action == "Redact"
+                ):
+                    redacted_message = analysis.modified_data.output.messages[-1].content
+                    yield TextStreamEvent(
+                        delta=ContentBlockDelta(text=self.block_message),
+                        text=redacted_message,
                     )
-                # TODO: Need to stream a SSE with key 'Data' as well
-                if analysis.evaluation and analysis.evaluation.action == "Block":
                     yield EventLoopStopEvent(
                         stop_reason="end_turn",
-                        message={"role": "assistant", "content": [{"text": "Blocked by Hiddenlayer"}]},
+                        message={"role": "assistant", "content": [{"text": redacted_message}]},
                         metrics=agent.event_loop_metrics,
                         request_state=None,
                     )
@@ -97,4 +159,4 @@ def init_hiddenlayer(
         hl_requester_id=hl_requester_id,
         hl_client=hl_client,
     )
-    strands.agent.agent.event_loop_cycle = hiddenlayer.new_event_loop_cycle
+    strands.agent.agent.event_loop_cycle = hiddenlayer.hl_event_loop_cycle
