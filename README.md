@@ -22,9 +22,7 @@ from strands_tools import calculator
 
 # Wire HiddenLayer into the Strands agent loop
 init_hiddenlayer(
-    model="HiddenLayer-Moderation-v1",
-    hl_project_id="proj_123",
-    hl_requester_id="Support Bot",
+    model="anthropic.claude-sonnet-4-20250514-v1:0",
 )
 
 agent = Agent(tools=[calculator])
@@ -33,7 +31,7 @@ response = agent("What is the square root of 1764?")
 print(response.message["content"][0]["text"])
 # -> "The square root of 1764 is 42."
 ```
-All traffic is scored by HiddenLayer. If the model recommends blocking, the agent yields `"Blocked by Hiddenlayer"` instead of executing the request. Redaction responses replace sensitive strings with `"REDACTED"` before they hit downstream consumers.
+All traffic is protected by HiddenLayer. If your policy is set to block, the agent yields `"Blocked by Hiddenlayer"` instead of executing the request. Redaction responses replace sensitive strings with `"REDACTED"` before they hit downstream consumers.
 
 ### Streaming Usage
 ```python
