@@ -1,13 +1,12 @@
+from typing import Optional
+
+import strands
 from hiddenlayer import HiddenLayer
 from hiddenlayer.types import InteractionAnalyzeResponse
-from strands.types._events import EventLoopStopEvent, TextStreamEvent
-from strands.types.streaming import ContentBlockDelta
-import strands
-
 from strands import Agent
 from strands.event_loop.event_loop import event_loop_cycle
-
-from typing import Optional
+from strands.types._events import EventLoopStopEvent, TextStreamEvent
+from strands.types.streaming import ContentBlockDelta
 
 
 class HiddenlayerStrands:
@@ -22,6 +21,8 @@ class HiddenlayerStrands:
         hl_requester_id: str = "Strands Agent",
         hl_client: Optional[HiddenLayer] = None,
     ):
+        """Configure HiddenLayer moderation defaults for a Strands agent instance."""
+
         self.model = model
         self.project_id = hl_project_id
         self.requester_id = hl_requester_id
@@ -29,6 +30,8 @@ class HiddenlayerStrands:
         self.hl_client = hl_client or HiddenLayer(base_url="https://api.stage.hiddenlayer.ai")
 
     def analyze_input(self, role: str, content: str) -> InteractionAnalyzeResponse:
+        """Submit the latest user turn for HiddenLayer analysis."""
+
         if self.project_id:
             analysis = self.hl_client.interactions.analyze(
                 metadata={"model": self.model, "requester_id": self.requester_id},
@@ -44,6 +47,8 @@ class HiddenlayerStrands:
         return analysis
 
     def analyze_output(self, content: str) -> InteractionAnalyzeResponse:
+        """Submit an assistant response for HiddenLayer analysis."""
+
         if self.project_id:
             analysis = self.hl_client.interactions.analyze(
                 metadata={"model": self.model, "requester_id": self.requester_id},
@@ -57,22 +62,31 @@ class HiddenlayerStrands:
             )
         return analysis
 
+    def _stream_event(self, message: str) -> TextStreamEvent:
+        """Create a Strands text stream event for a moderation message."""
+        return TextStreamEvent(
+            delta=ContentBlockDelta(text=message),
+            text=message,
+        )
+
+    def _event_loop_stop_event(self, agent: Agent, message: str) -> EventLoopStopEvent:
+        """Create an event loop stop event signaling moderation intervention."""
+        return EventLoopStopEvent(
+            stop_reason="guardrail_intervened",
+            message={"role": "assistant", "content": [{"text": message}]},
+            metrics=agent.event_loop_metrics,
+            request_state=None,
+        )
+
     async def hl_event_loop_cycle(self, agent: Agent, invocation_state, structured_output_context=None):
+        """Bridge the Strands event loop with HiddenLayer moderation for both input and output."""
+
         # Otherwise, delegate and optionally intercept / modify events
-        print(agent.messages[-1])
         if text := agent.messages[-1]["content"][-1].get("text"):
             analysis = self.analyze_input(role=agent.messages[-1]["role"], content=text)
             if analysis.evaluation and analysis.evaluation.action == "Block":
-                yield TextStreamEvent(
-                    delta=ContentBlockDelta(text=self.block_message),
-                    text=self.block_message,
-                )
-                yield EventLoopStopEvent(
-                    stop_reason="end_turn",
-                    message={"role": "assistant", "content": [{"text": self.block_message}]},
-                    metrics=agent.event_loop_metrics,
-                    request_state=None,
-                )
+                yield self._stream_event(self.block_message)
+                yield self._event_loop_stop_event(agent=agent, message=self.block_message)
                 return
 
             if analysis.evaluation and analysis.modified_data.input.messages and analysis.evaluation.action == "Redact":
@@ -87,37 +101,21 @@ class HiddenlayerStrands:
 
                 # Handled structured output case where each field in the structured output
                 # is its own output
-                if structured_output_context.is_enabled:
+                if structured_output_context and structured_output_context.is_enabled:
                     outputs = final_message["content"][-1]["toolUse"]["input"]
 
                     for output in outputs.values():
                         analysis = self.analyze_output(output)
 
                         if analysis.evaluation and analysis.evaluation.action == "Block":
-                            yield TextStreamEvent(
-                                delta=ContentBlockDelta(text=self.block_message),
-                                text=self.block_message,
-                            )
-                            yield EventLoopStopEvent(
-                                stop_reason="end_turn",
-                                message={"role": "assistant", "content": [{"text": self.block_message}]},
-                                metrics=agent.event_loop_metrics,
-                                request_state=None,
-                            )
+                            yield self._stream_event(message=self.block_message)
+                            yield self._event_loop_stop_event(agent=agent, message=self.block_message)
                             return
                 else:
                     analysis = self.analyze_output(content=final_message["content"][-1]["text"])
                     if analysis.evaluation and analysis.evaluation.action == "Block":
-                        yield TextStreamEvent(
-                            delta=ContentBlockDelta(text=self.block_message),
-                            text=self.block_message,
-                        )
-                        yield EventLoopStopEvent(
-                            stop_reason="end_turn",
-                            message={"role": "assistant", "content": [{"text": self.block_message}]},
-                            metrics=agent.event_loop_metrics,
-                            request_state=None,
-                        )
+                        yield self._stream_event(message=self.block_message)
+                        yield self._event_loop_stop_event(agent=agent, message=self.block_message)
                         return
 
                 if (
@@ -126,16 +124,8 @@ class HiddenlayerStrands:
                     and analysis.evaluation.action == "Redact"
                 ):
                     redacted_message = analysis.modified_data.output.messages[-1].content
-                    yield TextStreamEvent(
-                        delta=ContentBlockDelta(text=self.block_message),
-                        text=redacted_message,
-                    )
-                    yield EventLoopStopEvent(
-                        stop_reason="end_turn",
-                        message={"role": "assistant", "content": [{"text": redacted_message}]},
-                        metrics=agent.event_loop_metrics,
-                        request_state=None,
-                    )
+                    yield self._stream_event(message=redacted_message)
+                    yield self._event_loop_stop_event(agent=agent, message=redacted_message)
                     return
 
                 for event in events:
@@ -151,6 +141,8 @@ def init_hiddenlayer(
     hl_requester_id: str = "Strands Agent",
     hl_client: Optional[HiddenLayer] = None,
 ):
+    """Install the HiddenLayer-backed event loop for all Strands agents."""
+
     hiddenlayer = HiddenlayerStrands(
         model=model,
         client_id=client_id,
