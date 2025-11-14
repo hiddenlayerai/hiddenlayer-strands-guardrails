@@ -2,6 +2,8 @@
 
 HiddenLayer moderation for Strands agents. This package wraps the Strands event loop so every inbound and outbound message is analyzed by HiddenLayer before it reaches a user or tool. Use it to enforce safety policies, redact sensitive data, and block malicious prompts in real time.
 
+> **Alpha status:** `hiddenlayer-strands` is currently in alpha. APIs, behaviors, and configuration surfaces may change without notice, and new releases can introduce breaking changes. Pin a version before using it in production workloads and re-test your integration after each upgrade.
+
 ## Features
 - Drop-in integration: `init_hiddenlayer` patches the Strands agent loop without altering your agent code.
 - Bidirectional filtering: both user inputs and assistant outputs are scanned, blocked, or redacted.
@@ -13,6 +15,13 @@ HiddenLayer moderation for Strands agents. This package wraps the Strands event 
 pip install hiddenlayer-strands
 ```
 The package targets Python 3.13+. When developing locally, you can also run `uv sync --dev` to install extras defined in `pyproject.toml`.
+
+## Configuration
+Set your HiddenLayer credentials via environment variables before importing the package:
+```bash
+export HIDDENLAYER_CLIENT_ID="..."
+export HIDDENLAYER_CLIENT_SECRET="..."
+```
 
 ## Quick Start
 ```python
@@ -82,13 +91,6 @@ if response.stop_reason == "guardrail_intervened":
 else:
     print(response.structured_output.result)
     # >>> 42
-```
-
-## Configuration
-Set your HiddenLayer credentials via environment variables before importing the package:
-```bash
-export HIDDENLAYER_CLIENT_ID="..."
-export HIDDENLAYER_CLIENT_SECRET="..."
 ```
 
 ## Testing
