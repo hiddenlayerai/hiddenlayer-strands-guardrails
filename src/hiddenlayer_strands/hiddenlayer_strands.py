@@ -6,6 +6,10 @@ from strands.event_loop.event_loop import event_loop_cycle
 from strands.types._events import EventLoopStopEvent, TextStreamEvent
 from strands.types.streaming import ContentBlockDelta
 
+import logging
+
+logger = logging.Logger(__name__)
+
 
 class HiddenlayerStrands:
     def __init__(
@@ -77,54 +81,65 @@ class HiddenlayerStrands:
         )
 
     async def hl_event_loop_cycle(self, agent: Agent, invocation_state, structured_output_context=None):
-        """Bridge the Strands event loop with HiddenLayer moderation for both input and output."""
+        """Bridge the Strands event loop with HiddenLayer moderation for both input and output.
+
+        If we can't scan inputs or outputs, log the error and continue - don't disrupt the user flow.
+        """
 
         # Otherwise, delegate and optionally intercept / modify events
-        if text := agent.messages[-1]["content"][-1].get("text"):
-            analysis = self.analyze_input(role=agent.messages[-1]["role"], content=text)
-            if analysis.evaluation and analysis.evaluation.action == "Block":
-                yield self._stream_event(self.block_message)
-                yield self._event_loop_stop_event(agent=agent, message=self.block_message)
-                return
+        try:
+            if text := agent.messages[-1]["content"][-1].get("text"):
+                analysis = self.analyze_input(role=agent.messages[-1]["role"], content=text)
+                if analysis.evaluation and analysis.evaluation.action == "Block":
+                    yield self._stream_event(self.block_message)
+                    yield self._event_loop_stop_event(agent=agent, message=self.block_message)
+                    return
 
-            if analysis.evaluation and analysis.modified_data.input.messages and analysis.evaluation.action == "Redact":
-                agent.messages[-1]["content"][-1]["text"] = analysis.modified_data.input.messages[-1].content
+                if analysis.evaluation and analysis.modified_data.input.messages and analysis.evaluation.action == "Redact":
+                    agent.messages[-1]["content"][-1]["text"] = analysis.modified_data.input.messages[-1].content
+        except Exception as e:
+            logger.error(f"Unable to scan inputs with Hiddenlayer: {e}")
+            
 
         events = []
         async for ev in event_loop_cycle(agent, invocation_state, structured_output_context):
             events.append(ev)
 
-            if isinstance(ev, EventLoopStopEvent):
-                final_message = ev["stop"][1]
+            try:
+                if isinstance(ev, EventLoopStopEvent):
+                    final_message = ev["stop"][1]
 
-                # Handled structured output case where each field in the structured output
-                # is its own output
-                if structured_output_context and structured_output_context.is_enabled:
-                    outputs = final_message["content"][-1]["toolUse"]["input"]
+                    # Handled structured output case where each field in the structured output
+                    # is its own output
+                    if structured_output_context and structured_output_context.is_enabled:
+                        outputs = final_message["content"][-1]["toolUse"]["input"]
 
-                    for output in outputs.values():
-                        analysis = self.analyze_output(output)
+                        for output in outputs.values():
+                            analysis = self.analyze_output(output)
 
+                            if analysis.evaluation and analysis.evaluation.action == "Block":
+                                yield self._stream_event(message=self.block_message)
+                                yield self._event_loop_stop_event(agent=agent, message=self.block_message)
+                                return
+                    else:
+                        analysis = self.analyze_output(content=final_message["content"][-1]["text"])
                         if analysis.evaluation and analysis.evaluation.action == "Block":
                             yield self._stream_event(message=self.block_message)
                             yield self._event_loop_stop_event(agent=agent, message=self.block_message)
                             return
-                else:
-                    analysis = self.analyze_output(content=final_message["content"][-1]["text"])
-                    if analysis.evaluation and analysis.evaluation.action == "Block":
-                        yield self._stream_event(message=self.block_message)
-                        yield self._event_loop_stop_event(agent=agent, message=self.block_message)
+
+                    if (
+                        analysis.evaluation
+                        and analysis.modified_data.output.messages
+                        and analysis.evaluation.action == "Redact"
+                    ):
+                        redacted_message = analysis.modified_data.output.messages[-1].content
+                        yield self._stream_event(message=redacted_message)
+                        yield self._event_loop_stop_event(agent=agent, message=redacted_message)
                         return
+            except Exception as e:
+                logger.error(f"Unable to scan inputs with Hiddenlayer: {e}")
+                
 
-                if (
-                    analysis.evaluation
-                    and analysis.modified_data.output.messages
-                    and analysis.evaluation.action == "Redact"
-                ):
-                    redacted_message = analysis.modified_data.output.messages[-1].content
-                    yield self._stream_event(message=redacted_message)
-                    yield self._event_loop_stop_event(agent=agent, message=redacted_message)
-                    return
-
-                for event in events:
-                    yield event
+        for event in events:
+            yield event
