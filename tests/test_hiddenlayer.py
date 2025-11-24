@@ -81,7 +81,7 @@ async def test_malicious_streaming():
     assert result.strip() == BLOCKED_RESPONSE
 
 
-@pytest.mark.skipif(IN_GITHUB_ACTIONS)
+@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="No AWS Access in CI")
 def test_pii_input_redaction():
     agent = Agent(tools=[calculator])
     _ = agent(PII_PROMPT)
@@ -98,16 +98,16 @@ def test_pii_output_redaction(mock_event_loop_cycle):
     assert output and "REDACTED" in output
 
 
-@pytest.mark.skipif(IN_GITHUB_ACTIONS)
+@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="No AWS Access in CI")
 def test_structured_output_benign(mock_event_loop_cycle):
     agent = Agent(tools=[calculator])
     res = agent(NORMAL_PROMPT, structured_output_model=MathResult)
 
-    assert res.structured_output.result == 42
+    assert res.structured_output and res.structured_output.result == 42
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(IN_GITHUB_ACTIONS)
+@pytest.mark.skipif(IN_GITHUB_ACTIONS, "No AWS Access in CI")
 async def test_structured_output_streaming_benign():
     agent = Agent(tools=[calculator])
 

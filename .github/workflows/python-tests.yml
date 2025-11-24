@@ -9,6 +9,9 @@ on:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    env:
+      HIDDENLAYER_CLIENT_ID: ${{ secrets.HIDDENLAYER_CLIENT_ID }}
+      HIDDENLAYER_CLIENT_SECRET: ${{ secrets.HIDDENLAYER_CLIENT_SECRET }}
     strategy:
       fail-fast: false
       matrix:

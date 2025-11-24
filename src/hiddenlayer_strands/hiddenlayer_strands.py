@@ -29,7 +29,7 @@ class HiddenlayerStrands:
         self.project_id = hl_project_id
         self.requester_id = hl_requester_id
         self.block_message = hl_block_message
-        self.hl_client = hl_client or HiddenLayer(base_url="https://api.stage.hiddenlayer.ai")
+        self.hl_client = hl_client or HiddenLayer(base_url="https://api.hiddenlayer.ai")
 
     def analyze_input(self, role: str, content: str) -> InteractionAnalyzeResponse:
         """Submit the latest user turn for HiddenLayer analysis."""
@@ -95,11 +95,14 @@ class HiddenlayerStrands:
                     yield self._event_loop_stop_event(agent=agent, message=self.block_message)
                     return
 
-                if analysis.evaluation and analysis.modified_data.input.messages and analysis.evaluation.action == "Redact":
+                if (
+                    analysis.evaluation
+                    and analysis.modified_data.input.messages
+                    and analysis.evaluation.action == "Redact"
+                ):
                     agent.messages[-1]["content"][-1]["text"] = analysis.modified_data.input.messages[-1].content
         except Exception as e:
             logger.error(f"Unable to scan inputs with Hiddenlayer: {e}")
-            
 
         events = []
         async for ev in event_loop_cycle(agent, invocation_state, structured_output_context):
@@ -139,7 +142,6 @@ class HiddenlayerStrands:
                         return
             except Exception as e:
                 logger.error(f"Unable to scan inputs with Hiddenlayer: {e}")
-                
 
         for event in events:
             yield event
