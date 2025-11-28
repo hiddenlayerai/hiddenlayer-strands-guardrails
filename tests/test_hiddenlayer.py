@@ -107,7 +107,7 @@ def test_structured_output_benign(mock_event_loop_cycle):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(IN_GITHUB_ACTIONS, "No AWS Access in CI")
+@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="No AWS Access in CI")
 async def test_structured_output_streaming_benign():
     agent = Agent(tools=[calculator])
 

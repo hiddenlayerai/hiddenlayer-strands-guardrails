@@ -55,4 +55,7 @@ def init_hiddenlayer(
         hl_requester_id=hl_requester_id,
         hl_client=hl_client,
     )
+
+    # We override the event loop because strands as of Nov 28, 2025 does not
+    # custom guardrails, so we add our own
     strands.agent.agent.event_loop_cycle = hiddenlayer.hl_event_loop_cycle
