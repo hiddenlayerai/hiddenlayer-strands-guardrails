@@ -2,7 +2,8 @@
 
 HiddenLayer moderation for Strands agents. This package wraps the Strands event loop so every inbound and outbound message is analyzed by HiddenLayer before it reaches a user or tool. Use it to enforce safety policies, redact sensitive data, and block malicious prompts in real time.
 
-> **Alpha status:** `hiddenlayer-strands` is currently in alpha. APIs, behaviors, and configuration surfaces may change without notice, and new releases can introduce breaking changes. Pin a version before using it in production workloads and re-test your integration after each upgrade.
+> [!IMPORTANT]
+> `hiddenlayer-strands` is currently in alpha and is not yet intended for production-critical workloads. APIs, behaviors, and configuration surfaces may change without notice, and new releases can introduce breaking changes. Pin a version before using it in production environments and re-test your integration after each upgrade.
 
 ## Features
 - Drop-in integration: `init_hiddenlayer` patches the Strands agent loop without altering your agent code.
