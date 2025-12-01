@@ -15,7 +15,7 @@ HiddenLayer moderation for Strands agents. This package wraps the Strands event 
 ```bash
 pip install hiddenlayer-strands
 ```
-The package targets Python 3.13+. When developing locally, you can also run `uv sync --dev` to install extras defined in `pyproject.toml`.
+The package targets Python 3.8+. When developing locally, you can also run `uv sync --dev` to install extras defined in `pyproject.toml`.
 
 ## Configuration
 Set your HiddenLayer credentials via environment variables before importing the package:
