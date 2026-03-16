@@ -7,8 +7,6 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from ._version import __version__
-
 import httpx
 import strands.event_loop.event_loop as _strands_agent_module
 from hiddenlayer import AsyncHiddenLayer
@@ -19,11 +17,10 @@ from strands.event_loop.event_loop import _handle_model_execution
 from strands.telemetry import Trace, Tracer
 from strands.tools.structured_output._structured_output_context import StructuredOutputContext
 from strands.types._events import (
-    EventLoopStopEvent,
-    TextStreamEvent,
     TypedEvent,
 )
-from strands.types.streaming import ContentBlockDelta
+
+from ._version import __version__
 
 REQUEST_EVALUATIONS_PATH = "/detection/v2/request-evaluations"
 RESPONSE_EVALUATIONS_PATH = "/detection/v2/response-evaluations"
@@ -61,13 +58,6 @@ class AnalysisResult:
     redacted_content: str | None
 
 
-def _safe_json_dumps(value: Any) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False, default=str)
-    except Exception:
-        return str(value)
-
-
 def _normalize_content(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -91,13 +81,11 @@ def _normalize_content(value: Any) -> str:
                 text_parts.append(part.text)
         if text_parts:
             return "\n".join(text_parts)
-        return _safe_json_dumps(value)
+        return json.dumps(value, ensure_ascii=False, default=str)
     if isinstance(value, dict):
-        return _safe_json_dumps(value)
-    try:
-        return str(value)
-    except Exception:
-        return _safe_json_dumps(value)
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    return str(value)
 
 
 def _strands_messages_to_openai(messages: list[Any]) -> list[dict[str, Any]]:
@@ -239,6 +227,95 @@ def _new_assistant_message_to_openai_response(new_messages: list[Any], model: st
     }
 
 
+def _apply_request_redaction(agent: StrandsAgent, redacted_body: dict) -> None:
+    """Apply redacted content from HL request-evaluation response back to agent.messages (in-place).
+
+    The HL API returns OpenAI-format messages after redaction. We map them back to the
+    Strands message format by walking both arrays simultaneously:
+    - Each toolResult block in a Strands message → one "tool" OpenAI message
+    - Text + toolUse blocks in a Strands message → one combined OpenAI message
+    """
+    redacted_messages = redacted_body.get("messages", [])
+
+    # Apply redaction to system prompt if present
+    if redacted_messages and redacted_messages[0].get("role") == "system":
+        new_system = redacted_messages[0].get("content")
+        if new_system and isinstance(new_system, str):
+            agent.system_prompt = new_system
+
+    redacted_non_system = [m for m in redacted_messages if m.get("role") != "system"]
+
+    redacted_idx = 0
+    for agent_msg in agent.messages:
+        if redacted_idx >= len(redacted_non_system):
+            break
+        content_blocks = agent_msg.get("content", [])
+        if not isinstance(content_blocks, list):
+            continue
+
+        # toolResult blocks each map to a separate OpenAI "tool" message
+        for block in content_blocks:
+            if not isinstance(block, dict) or "toolResult" not in block:
+                continue
+            if redacted_idx >= len(redacted_non_system):
+                break
+            redacted_msg = redacted_non_system[redacted_idx]
+            redacted_idx += 1
+            if redacted_msg.get("role") != "tool":
+                continue
+            new_text = redacted_msg.get("content") or ""
+            tr = block["toolResult"]
+            tr_content = tr.get("content", [])
+            if isinstance(tr_content, list):
+                updated = False
+                for c in tr_content:
+                    if isinstance(c, dict) and "text" in c:
+                        c["text"] = new_text
+                        updated = True
+                        break
+                if not updated:
+                    tr["content"] = [{"text": new_text}]
+            else:
+                tr["content"] = new_text
+
+        # text + toolUse blocks map to one combined OpenAI message
+        text_blocks = [b for b in content_blocks if isinstance(b, dict) and "text" in b]
+        tool_use_blocks = [b for b in content_blocks if isinstance(b, dict) and "toolUse" in b]
+        if text_blocks or tool_use_blocks:
+            if redacted_idx < len(redacted_non_system):
+                redacted_msg = redacted_non_system[redacted_idx]
+                redacted_idx += 1
+                new_content = redacted_msg.get("content")
+                if new_content and isinstance(new_content, str) and text_blocks:
+                    text_blocks[0]["text"] = new_content
+
+
+def _apply_response_redaction(new_messages: list[Any], redacted_body: dict) -> None:
+    """Apply redacted content from HL response-evaluation back to the new assistant messages (in-place).
+
+    The HL API returns an OpenAI choices payload after redaction. We update the text content
+    of the first assistant message in new_messages with the redacted content.
+    """
+    choices = redacted_body.get("choices", [])
+    if not choices:
+        return
+    new_content = choices[0].get("message", {}).get("content")
+    if new_content is None:
+        return
+
+    for msg in new_messages:
+        if msg.get("role") != "assistant":
+            continue
+        content_blocks = msg.get("content", [])
+        if not isinstance(content_blocks, list):
+            break
+        for block in content_blocks:
+            if isinstance(block, dict) and "text" in block:
+                block["text"] = new_content
+                break
+        break
+
+
 def _parse_analysis(response: Any, role: Literal["user", "assistant"]) -> AnalysisResult:
     try:
         action = response.evaluation.action if response.evaluation else None
@@ -281,22 +358,6 @@ class HiddenlayerStrands:
             options["headers"]["hl-runtime-session-id"] = session_id
         return options
 
-    async def _submit_request_evaluation(self, body: dict, roundtrip_id: str, session_id: str | None = None) -> httpx.Response:
-        return await self.hl_client.post(
-            REQUEST_EVALUATIONS_PATH,
-            cast_to=httpx.Response,
-            body=body,
-            options=self._build_options(roundtrip_id, session_id),
-        )
-
-    async def _submit_response_evaluation(self, body: dict, roundtrip_id: str, session_id: str | None = None) -> httpx.Response:
-        return await self.hl_client.post(
-            RESPONSE_EVALUATIONS_PATH,
-            cast_to=httpx.Response,
-            body=body,
-            options=self._build_options(roundtrip_id, session_id),
-        )
-
     async def handle_model_execution(
         self,
         agent: StrandsAgent,
@@ -319,9 +380,15 @@ class HiddenlayerStrands:
                 "messages": messages,
                 "tools": _strands_tools_to_openai(agent),
             }
-            resp = await self._submit_request_evaluation(request_body, roundtrip_id, session_id)
+            resp = await self.hl_client.post(
+                REQUEST_EVALUATIONS_PATH,
+                cast_to=httpx.Response,
+                body=request_body,
+                options=self._build_options(roundtrip_id, session_id),
+            )
             if resp.headers.get("hl-runtime-action", "").upper() == "BLOCK":
                 raise InputBlockedError(self.block_message)
+            _apply_request_redaction(agent, resp.json())
         except InputBlockedError:
             raise
         except Exception:
@@ -339,81 +406,22 @@ class HiddenlayerStrands:
             response_body = _new_assistant_message_to_openai_response(
                 new_messages, self.hiddenlayer_params.model or "unknown"
             )
-            resp = await self._submit_response_evaluation(response_body, roundtrip_id, session_id)
+
+            resp = await self.hl_client.post(
+                RESPONSE_EVALUATIONS_PATH,
+                cast_to=httpx.Response,
+                body=response_body,
+                options=self._build_options(roundtrip_id, session_id),
+            )
+
             if resp.headers.get("hl-runtime-action", "").upper() == "BLOCK":
                 raise OutputBlockedError(self.block_message)
+
+            _apply_response_redaction(new_messages, resp.json())
         except OutputBlockedError:
             raise
         except Exception:
             logger.warning("Failed to submit response evaluation to HiddenLayer", exc_info=True)
-
-    # async def hl_event_loop_cycle(self, agent: StrandsAgent, invocation_state, structured_output_context=None):
-    #     """Bridge the Strands event loop with HiddenLayer moderation for both input and output."""
-    #     try:
-    #         if text := agent.messages[-1]["content"][-1].get("text"):
-    #             response = await self._analyze_content(
-    #                 [{"role": agent.messages[-1]["role"], "content": text}],
-    #                 "user",
-    #             )
-    #             result = _parse_analysis(response, "user")
-
-    #             if result.block:
-    #                 yield self._stream_event(self.block_message)
-    #                 yield self._event_loop_stop_event(agent=agent, message=self.block_message)
-    #                 return
-
-    #             if result.redact and result.redacted_content:
-    #                 agent.messages[-1]["content"][-1]["text"] = result.redacted_content
-    #     except Exception as e:
-    #         logger.error(f"Unable to scan inputs with HiddenLayer: {e}")
-
-    #     events = []
-    #     output_result: AnalysisResult | None = None
-    #     async for ev in event_loop_cycle(agent, invocation_state, structured_output_context):
-    #         events.append(ev)
-
-    #         try:
-    #             if isinstance(ev, EventLoopStopEvent):
-    #                 final_message = ev["stop"][1]
-
-    #                 if structured_output_context and structured_output_context.is_enabled:
-    #                     outputs = final_message["content"][-1]["toolUse"]["input"]
-    #                     for output in outputs.values():
-    #                         response = await self._analyze_content(
-    #                             [{"role": "assistant", "content": _normalize_content(output)}],
-    #                             "assistant",
-    #                         )
-    #                         output_result = _parse_analysis(response, "assistant")
-    #                         if output_result.block:
-    #                             yield self._stream_event(message=self.block_message)
-    #                             yield self._event_loop_stop_event(agent=agent, message=self.block_message)
-    #                             return
-    #                 else:
-    #                     response = await self._analyze_content(
-    #                         [
-    #                             {
-    #                                 "role": "assistant",
-    #                                 "content": _normalize_content(final_message["content"][-1]["text"]),
-    #                             }
-    #                         ],
-    #                         "assistant",
-    #                     )
-    #                     output_result = _parse_analysis(response, "assistant")
-
-    #                     if output_result.block:
-    #                         yield self._stream_event(message=self.block_message)
-    #                         yield self._event_loop_stop_event(agent=agent, message=self.block_message)
-    #                         return
-
-    #                 if output_result is not None and output_result.redact and output_result.redacted_content:
-    #                     yield self._stream_event(message=output_result.redacted_content)
-    #                     yield self._event_loop_stop_event(agent=agent, message=output_result.redacted_content)
-    #                     return
-    #         except Exception as e:
-    #             logger.error(f"Unable to scan outputs with HiddenLayer: {e}")
-
-    #     for event in events:
-    #         yield event
 
 
 class Agent:
@@ -472,7 +480,6 @@ class Agent:
             hl_block_message=hl_block_message,
             hl_client=hiddenlayer_client,
         )
-        # _strands_agent_module.event_loop_cycle = guardrail.hl_event_loop_cycle  # type: ignore[attr-defined]
         _strands_agent_module._handle_model_execution = guardrail.handle_model_execution  # ty:ignore[unresolved-attribute]
 
         return StrandsAgent(**agent_kwargs)
