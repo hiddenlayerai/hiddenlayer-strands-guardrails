@@ -1,6 +1,6 @@
 [project]
 name = "hiddenlayer-strands"
-version = "0.0.1"
+version = "0.1.0"
 description = "Official Hiddenlayer AWS Strands integration."
 readme = "README.md"
 license = {text = "Apache-2.0"}

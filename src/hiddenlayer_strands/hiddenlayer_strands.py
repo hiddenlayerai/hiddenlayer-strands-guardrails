@@ -13,7 +13,7 @@ from hiddenlayer import AsyncHiddenLayer
 from hiddenlayer._types import RequestOptions
 from pydantic import BaseModel, Field
 from strands import Agent as StrandsAgent
-from strands.event_loop.event_loop import _handle_model_execution
+from strands.event_loop.event_loop import _handle_model_execution as _original_handle_model_execution
 from strands.telemetry import Trace, Tracer
 from strands.tools.structured_output._structured_output_context import StructuredOutputContext
 from strands.types._events import (
@@ -396,7 +396,7 @@ class HiddenlayerStrands:
 
         msg_count_before = len(agent.messages)
 
-        async for event in _handle_model_execution(
+        async for event in _original_handle_model_execution(
             agent, cycle_span, cycle_trace, invocation_state, tracer, structured_output_context
         ):
             yield event
@@ -480,6 +480,17 @@ class Agent:
             hl_block_message=hl_block_message,
             hl_client=hiddenlayer_client,
         )
-        _strands_agent_module._handle_model_execution = guardrail.handle_model_execution  # ty:ignore[unresolved-attribute]
+        async def _safe_handle_model_execution(*args: Any, **kwargs: Any) -> AsyncGenerator[TypedEvent, None]:
+            try:
+                async for event in guardrail.handle_model_execution(*args, **kwargs):
+                    yield event
+            except (InputBlockedError, OutputBlockedError):
+                raise
+            except Exception:
+                logger.warning("HiddenLayer guardrail failed, falling back to original handler", exc_info=True)
+                async for event in _original_handle_model_execution(*args, **kwargs):
+                    yield event
+
+        _strands_agent_module._handle_model_execution = _safe_handle_model_execution  # ty:ignore[unresolved-attribute]
 
         return StrandsAgent(**agent_kwargs)
