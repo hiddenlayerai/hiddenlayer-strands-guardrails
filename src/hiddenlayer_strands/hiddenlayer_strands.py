@@ -14,9 +14,10 @@ from hiddenlayer._types import RequestOptions
 from pydantic import BaseModel, Field
 from strands import Agent as StrandsAgent
 from strands.event_loop.event_loop import _handle_model_execution as _original_handle_model_execution
-from strands.telemetry import Trace, Tracer
-from strands.tools.structured_output._structured_output_context import StructuredOutputContext
 from strands.types._events import (
+    ModelStopReason,
+    ModelStreamChunkEvent,
+    TextStreamEvent,
     TypedEvent,
 )
 
@@ -36,6 +37,17 @@ class HiddenLayerParams(BaseModel):
     requester_id: str = Field(
         default_factory=lambda: os.getenv("HIDDENLAYER_REQUESTER_ID", "hiddenlayer-strands-integration")
     )
+
+
+OutputStreaming = Literal["buffered", "passthrough"]
+"""How assistant output is streamed while HiddenLayer evaluates it.
+
+- ``"buffered"`` (default): the model's stream events are held until HiddenLayer has evaluated the complete
+  response, then released, with the text replaced by the redacted text if the policy redacts. Blocked output is
+  never released.
+- ``"passthrough"``: events are released as the model produces them. Blocking and redaction still apply to the
+  message saved to the conversation, but tokens already streamed to the consumer cannot be recalled.
+"""
 
 
 class HiddenlayerActions(str, Enum):
@@ -309,11 +321,58 @@ def _apply_response_redaction(new_messages: list[Any], redacted_body: dict) -> N
         content_blocks = msg.get("content", [])
         if not isinstance(content_blocks, list):
             break
+        # HiddenLayer evaluated all text blocks joined together and returns one redacted string, so it replaces the
+        # first text block and the remaining text blocks are dropped. Leaving them in place would keep their
+        # original, unredacted text in the message.
+        first_text_seen = False
+        kept_blocks = []
         for block in content_blocks:
             if isinstance(block, dict) and "text" in block:
+                if first_text_seen:
+                    continue
                 block["text"] = new_content
-                break
+                first_text_seen = True
+            kept_blocks.append(block)
+        content_blocks[:] = kept_blocks
         break
+
+
+def _response_redacted_text(redacted_body: Any) -> str | None:
+    """Return the redacted assistant text from a response-evaluation body, or None if nothing was redacted."""
+    if not isinstance(redacted_body, dict):
+        return None
+    choices = redacted_body.get("choices") or []
+    if not choices:
+        return None
+    content = choices[0].get("message", {}).get("content")
+    return content if isinstance(content, str) else None
+
+
+def _carries_assistant_text(event: Any) -> bool:
+    """True for stream events that carry assistant text: text deltas and the raw text chunks behind them."""
+    if isinstance(event, TextStreamEvent):
+        return True
+    if isinstance(event, ModelStreamChunkEvent):
+        delta = (event.chunk or {}).get("contentBlockDelta", {}).get("delta", {})
+        return "text" in delta
+    return False
+
+
+def _redacted_stream_events(held: list[Any], redacted_text: str) -> list[Any]:
+    """Replace the held text events with a single raw chunk and text delta carrying the redacted text."""
+    released: list[Any] = []
+    replaced = False
+    for event in held:
+        if not _carries_assistant_text(event):
+            released.append(event)
+            continue
+        if replaced:
+            continue
+        delta = {"text": redacted_text}
+        released.append(ModelStreamChunkEvent({"contentBlockDelta": {"delta": delta}}))
+        released.append(TextStreamEvent(delta=delta, text=redacted_text))
+        replaced = True
+    return released
 
 
 def _parse_analysis(response: Any, role: Literal["user", "assistant"]) -> AnalysisResult:
@@ -339,10 +398,14 @@ class HiddenlayerStrands:
         hiddenlayer_params: HiddenLayerParams,
         hl_block_message: str = "Blocked by HiddenLayer",
         hl_client: AsyncHiddenLayer | None = None,
+        hl_output_streaming: OutputStreaming = "buffered",
     ):
+        if hl_output_streaming not in ("buffered", "passthrough"):
+            raise ValueError(f"hl_output_streaming must be 'buffered' or 'passthrough', got {hl_output_streaming!r}")
         self.hiddenlayer_params = hiddenlayer_params
         self.block_message = hl_block_message
         self.hl_client: AsyncHiddenLayer = hl_client or AsyncHiddenLayer()
+        self.output_streaming: OutputStreaming = hl_output_streaming
 
     def _build_options(self, roundtrip_id: str, session_id: str | None = None) -> RequestOptions:
         options: RequestOptions = {
@@ -361,12 +424,20 @@ class HiddenlayerStrands:
     async def handle_model_execution(
         self,
         agent: StrandsAgent,
-        cycle_span: Any,
-        cycle_trace: Trace,
-        invocation_state: dict[str, Any],
-        tracer: Tracer,
-        structured_output_context: StructuredOutputContext,
+        *args: Any,
+        **kwargs: Any,
     ) -> AsyncGenerator[TypedEvent, None]:
+        """Wrap Strands' model execution with request and response evaluation.
+
+        The positional and keyword arguments after ``agent`` are forwarded unchanged to Strands'
+        ``_handle_model_execution`` (``cycle_span``, ``cycle_trace``, ``invocation_state``, ``tracer``,
+        ``structured_output_context`` and, from strands-agents 1.63, ``invocation_context``), so the wrapper keeps
+        working when Strands adds parameters.
+
+        The response is evaluated when the model's stop event arrives. At that point Strands has not yet appended
+        the assistant message to ``agent.messages``, so a blocked message is never added to the conversation (or to
+        a session manager), and a redaction is applied before the message is stored.
+        """
         roundtrip_id = str(uuid4())
         session_id: str | None = getattr(getattr(agent, "_session_manager", None), "session_id", None)
 
@@ -394,17 +465,38 @@ class HiddenlayerStrands:
         except Exception:
             logger.warning("Failed to submit request evaluation to HiddenLayer", exc_info=True)
 
-        msg_count_before = len(agent.messages)
-
-        async for event in _original_handle_model_execution(
-            agent, cycle_span, cycle_trace, invocation_state, tracer, structured_output_context
-        ):
-            yield event
-
+        buffered = self.output_streaming == "buffered"
+        held: list[Any] = []
+        model_events = _original_handle_model_execution(agent, *args, **kwargs)
         try:
-            new_messages = agent.messages[msg_count_before:]
+            async for event in model_events:
+                if isinstance(event, ModelStopReason):
+                    _, message, *_ = event["stop"]
+                    redacted_text = await self._evaluate_response(message, roundtrip_id, session_id)
+                    if buffered:
+                        released = _redacted_stream_events(held, redacted_text) if redacted_text is not None else held
+                        for held_event in released:
+                            yield held_event
+                        held = []
+                    yield event
+                elif buffered:
+                    held.append(event)
+                else:
+                    yield event
+            for held_event in held:
+                yield held_event
+        finally:
+            await model_events.aclose()
+
+    async def _evaluate_response(self, message: Any, roundtrip_id: str, session_id: str | None) -> str | None:
+        """Evaluate one assistant message, redacting it in place.
+
+        Returns the redacted text when HiddenLayer redacted the message, None otherwise. Raises OutputBlockedError
+        when HiddenLayer blocks it. Evaluation failures are logged and the message passes unchanged.
+        """
+        try:
             response_body = _new_assistant_message_to_openai_response(
-                new_messages, self.hiddenlayer_params.model or "unknown"
+                [message], self.hiddenlayer_params.model or "unknown"
             )
 
             resp = await self.hl_client.post(
@@ -417,11 +509,18 @@ class HiddenlayerStrands:
             if resp.headers.get("hl-runtime-action", "").upper() == "BLOCK":
                 raise OutputBlockedError(self.block_message)
 
-            _apply_response_redaction(new_messages, resp.json())
+            redacted_body = resp.json()
+            redacted_text = _response_redacted_text(redacted_body)
+            original_text = response_body["choices"][0]["message"]["content"] if response_body["choices"] else None
+            if redacted_text is None or redacted_text == original_text:
+                return None
+            _apply_response_redaction([message], redacted_body)
+            return redacted_text
         except OutputBlockedError:
             raise
         except Exception:
             logger.warning("Failed to submit response evaluation to HiddenLayer", exc_info=True)
+            return None
 
 
 class Agent:
@@ -453,6 +552,7 @@ class Agent:
         hiddenlayer_params: HiddenLayerParams | None = None,
         hiddenlayer_client: AsyncHiddenLayer | None = None,
         hl_block_message: str = "Blocked by HiddenLayer",
+        hl_output_streaming: OutputStreaming = "buffered",
         **agent_kwargs: Any,
     ) -> StrandsAgent:
         """Create a strands.Agent with HiddenLayer guardrails configured.
@@ -461,6 +561,10 @@ class Agent:
             hiddenlayer_params: HiddenLayerParams for configuration. Defaults are used if not provided.
             hiddenlayer_client: Optional AsyncHiddenLayer client instance.
             hl_block_message: Message returned to the user when content is blocked.
+            hl_output_streaming: ``"buffered"`` (default) holds the model's stream events until HiddenLayer has
+                evaluated the response, so blocked or redacted text never reaches stream consumers or callback
+                handlers. ``"passthrough"`` streams events immediately and only enforces the verdict on the message
+                saved to the conversation.
             **agent_kwargs: All other arguments forwarded to strands.Agent (model, tools, system_prompt, etc.)
 
         Returns:
@@ -479,6 +583,7 @@ class Agent:
             hiddenlayer_params=hiddenlayer_params,
             hl_block_message=hl_block_message,
             hl_client=hiddenlayer_client,
+            hl_output_streaming=hl_output_streaming,
         )
         async def _safe_handle_model_execution(*args: Any, **kwargs: Any) -> AsyncGenerator[TypedEvent, None]:
             try:

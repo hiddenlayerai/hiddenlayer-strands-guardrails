@@ -94,6 +94,26 @@ else:
     # >>> 42
 ```
 
+## Output streaming
+HiddenLayer evaluates the complete assistant response, so by default the guardrail holds the model's stream events until that evaluation returns:
+
+- If the response passes, the held events are released unchanged.
+- If the policy redacts, the text events are replaced by the redacted text.
+- If the policy blocks, nothing is released and `OutputBlockedError` is raised.
+
+In every mode the verdict is applied before Strands adds the assistant message to `agent.messages`, so a blocked response never enters the conversation or a session manager, and a redacted one is stored redacted.
+
+Buffering means a stream consumer receives each model turn only after it is complete. If you need tokens as they are generated, pass `hl_output_streaming="passthrough"`. Blocking and redaction then still apply to the stored message, but text already streamed to the consumer (and to any `callback_handler`) cannot be recalled.
+
+```python
+from hiddenlayer_strands import Agent, HiddenLayerParams
+
+agent = Agent(
+    hiddenlayer_params=HiddenLayerParams(model="anthropic.claude-sonnet-4-20250514-v1:0"),
+    hl_output_streaming="passthrough",  # default: "buffered"
+)
+```
+
 ## Testing
 The repository ships with pytest coverage for synchronous, streaming, and structured-output flows:
 ```bash
